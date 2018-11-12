@@ -25,10 +25,10 @@
 
 ## Запуск
 Последовательно запустить (например, в IntelliJ IDEA):
-* `perm.tryfuture.exchange.ExchangeServerStarter`
-* `perm.tryfuture.exchange.NewsServersStarter`
+* `perm.tryfuture.exchange.ExchangeServer`
+* `perm.tryfuture.exchange.NewsServer`
 * `perm.tryfuture.exchange.UI`
-* `perm.tryfuture.exchange.TraderStarter`
+* `perm.tryfuture.exchange.Trader`
 
 ## Текущие ограничения
 * У трейдеров нет состояния (количества акций и денег). Трейдер может купить/продать бесконечно много акций.

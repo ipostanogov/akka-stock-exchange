@@ -1,64 +1,107 @@
 package perm.tryfuture.exchange
 
-import akka.actor.{Props, Actor, ActorRef, ActorSystem}
-import akka.pattern.ask
+import java.util.concurrent.ThreadLocalRandom
+
+import akka.actor.Scheduler
+import akka.actor.typed.receptionist.Receptionist
+import akka.actor.typed.receptionist.Receptionist.Subscribe
+import akka.actor.typed.scaladsl.AskPattern._
+import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
 import akka.util.Timeout
 
-import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
-import scala.concurrent.{Await, Future}
+import scala.concurrent.{ExecutionContextExecutor, Future}
+import scala.math.BigDecimal.RoundingMode
 import scala.util.Random
 
-class Trader(server: ActorRef, newsSites: Iterable[ActorRef]) extends Actor {
-  val tick = context.system.scheduler.schedule(1000.millis, 1000.millis, self, "tick")
+object Trader {
 
-  override def receive = {
-    case "tick" ⇒
-      implicit val timeout = new Timeout(100.millis)
-      val amount = Random.nextInt(200)
-      // Запрашиваем список новостей
-      val news = newsSites.map(ask(_, NewsServer.GetNews).mapTo[NewsServer.News])
-      // Дожидаемся всех ответов и выбираем случайную
-      // Можно заменить на выбор самой популярной
-      Future.sequence(news).map(Random.shuffle(_).headOption.foreach { case news: NewsServer.News ⇒
-        if (news.isGood) {
-          // Если новость хорошая, то лучше покупать
-          ask(server, ExchangeServer.GetRates).mapTo[ExchangeServer.Rates].map {
-            case ExchangeServer.Rates(_, br: ExchangeServer.BuyRate) ⇒
-              // Предлагаем цену иногда лучшую, чем самая лучшая текущая цена
-              server ! ExchangeServer.Buy(br.rate - 40 + Random.nextInt(80), amount)
-            case _ ⇒
-              // Для инициализации торгов
-              server ! ExchangeServer.Buy(Random.nextInt(100) + 400, amount)
-          }
-        } else {
-          ask(server, ExchangeServer.GetRates).mapTo[ExchangeServer.Rates].map {
-            case ExchangeServer.Rates(sr: ExchangeServer.SellRate, _) ⇒
-              server ! ExchangeServer.Sell(sr.rate + 40 - Random.nextInt(80), amount)
-            case _ ⇒
-              server ! ExchangeServer.Sell(Random.nextInt(100) + 400, amount)
-          }
+  def main(args: Array[String]): Unit = {
+    ActorSystem(init(), Configs.actorSystemName, Configs.systemTraders)
+  }
+
+  private[this] def init(): Behavior[TraderCommand] = Behaviors.setup { ctx =>
+    val listingResponseMapper: ActorRef[Receptionist.Listing] = ctx.messageAdapter(listing => ListingEvent(listing))
+    ctx.system.receptionist ! Subscribe(ExchangeServer.exchangeServerServiceKey, listingResponseMapper)
+    ctx.system.receptionist ! Subscribe(NewsServer.newsServerServiceKey, listingResponseMapper)
+    setup(None, Set())
+  }
+
+  private[this] def setup(exchangeServer: Option[ActorRef[ExchangeServer.ExchangeServerCommand]], newsServers: Set[ActorRef[NewsServer.NewsServerCommand]]): Behavior[TraderCommand] = Behaviors.setup { ctx =>
+    exchangeServer match {
+      case Some(exServer) if newsServers.size == Configs.numberOfNewsServers =>
+        for (_ <- 1 to 100)
+          ctx.spawnAnonymous(mainBehavior(exServer, newsServers))
+        Behaviors.ignore
+      case _ =>
+        Behaviors.receiveMessage {
+          case ListingEvent(listing) =>
+            listing match {
+              case ExchangeServer.exchangeServerServiceKey.Listing(lst) =>
+                setup(lst.headOption.map(_.asInstanceOf[ActorRef[ExchangeServer.ExchangeServerCommand]]), newsServers)
+              case NewsServer.newsServerServiceKey.Listing(lst) =>
+                setup(exchangeServer, lst.map(_.asInstanceOf[ActorRef[NewsServer.NewsServerCommand]]))
+            }
+          case _ =>
+            Behaviors.same
         }
-      })
+    }
   }
-}
 
-object TraderStarter extends App {
-  val system = ActorSystem("akka-stock-exchange-traders", Configs.systemTraders)
-  implicit val timeout = new Timeout(1000.millis)
-  val newsServersFuture = Future.sequence((1 to Configs.numberOfNewsServers).map { case id ⇒
-    // Получить ссылки на новостные сайты
-    system.actorSelection(s"akka.tcp://akka-stock-exchange-news@127.0.0.1:59002/user/newsServer-$id").resolveOne()
-  })
-  // Получить ссылку на сервер биржи
-  val exchangeServerFuture = system.actorSelection("akka.tcp://akka-stock-exchange-xServer@127.0.0.1:59001/user/exchangeServer").resolveOne()
-  for {
-    server <- exchangeServerFuture
-    newsServers <- newsServersFuture
-    // Запускаем много трейдеров
-    _ <- 1 to 1000
-  } {
-    system.actorOf(Props(classOf[Trader], server, newsServers))
+  private[this] def scheduleTick(ctx: ActorContext[TraderCommand]) = {
+    ctx.scheduleOnce(2.seconds, ctx.self, Tick)
   }
-  Await.result(system.whenTerminated, Duration.Inf)
+
+  private[this] def mainBehavior(exchangeServer: ActorRef[ExchangeServer.ExchangeServerCommand], newsServers: Set[ActorRef[NewsServer.NewsServerCommand]]): Behavior[TraderCommand] = Behaviors.setup { ctx =>
+    scheduleTick(ctx)
+    val exServerResponseMapper: ActorRef[ExchangeServer.ExecutedOrder] = ctx.messageAdapter(exOrder => WrappedExecutedOrder(exOrder))
+    implicit val timeout: Timeout = 1.second
+    implicit val scheduler: Scheduler = ctx.system.scheduler
+    implicit val ec: ExecutionContextExecutor = ctx.system.executionContext
+    Behaviors.receiveMessage {
+      case Tick =>
+        val newsF: Set[Future[NewsServer.News]] = newsServers.map(_ ? NewsServer.GetNews)
+        val randomSortedNewsF: Future[List[NewsServer.News]] = Future.sequence(newsF.toList).map(Random.shuffle(_))
+        val pricesF: Future[ExchangeServer.CurrentPrices] = exchangeServer ? ExchangeServer.GetPrices
+        pricesF.zip(randomSortedNewsF).collect {
+          case (prices, chosenNews :: _) =>
+            implicit class RichBigDecimal(bd: BigDecimal) {
+              def ceil: BigDecimal = bd.setScale(0, RoundingMode.CEILING)
+            }
+
+            val random = ThreadLocalRandom.current()
+            val quantity = random.nextLong(200) + 1
+            val priceModifier = 1.0 + random.nextGaussian() * 0.07
+            val fairValue = BigDecimal("500")
+            if (chosenNews.isGood) {
+              prices match {
+                case ExchangeServer.CurrentPrices(_, Some(sellPrice)) =>
+                  exchangeServer ! ExchangeServer.BuyOrder((sellPrice * priceModifier * 0.99).ceil, quantity, exServerResponseMapper)
+                case _ =>
+                  exchangeServer ! ExchangeServer.BuyOrder((fairValue * priceModifier).ceil, quantity, exServerResponseMapper)
+              }
+            } else {
+              prices match {
+                case ExchangeServer.CurrentPrices(Some(buyPrice), _) =>
+                  exchangeServer ! ExchangeServer.SellOrder((buyPrice * priceModifier * 1.01).ceil, quantity, exServerResponseMapper)
+                case _ =>
+                  exchangeServer ! ExchangeServer.SellOrder((fairValue * priceModifier).ceil, quantity, exServerResponseMapper)
+              }
+            }
+        } onComplete { _ => scheduleTick(ctx) }
+        Behaviors.same
+      case _ =>
+        Behaviors.same
+    }
+  }
+
+  private[this] sealed trait TraderCommand
+
+  private[this] final case class ListingEvent(listing: Receptionist.Listing) extends TraderCommand
+
+  private[this] final case class WrappedExecutedOrder(order: ExchangeServer.ExecutedOrder) extends TraderCommand
+
+  private[this] final case object Tick extends TraderCommand
+
 }

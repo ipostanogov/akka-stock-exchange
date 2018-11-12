@@ -1,40 +1,68 @@
 package perm.tryfuture.exchange
 
-import akka.actor.{Actor, ActorSystem, Props}
+import java.util.concurrent.ThreadLocalRandom
 
-import scala.concurrent.Await
-import scala.concurrent.ExecutionContext.Implicits.global
+import akka.NotUsed
+import akka.actor.typed.receptionist.Receptionist.Register
+import akka.actor.typed.receptionist.ServiceKey
+import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
+import akka.actor.typed.{ActorRef, ActorSystem, Behavior, DispatcherSelector}
+import akka.dispatch.{PriorityGenerator, UnboundedStablePriorityMailbox}
+import com.typesafe.config.Config
+
 import scala.concurrent.duration._
-import scala.util.Random
-
-class NewsServer extends Actor {
-
-  import NewsServer._
-
-  var news = News(isGood = true)
-  val tick = context.system.scheduler.schedule(100.millis, (Random.nextInt(1000) + 400).millis, self, "tick")
-
-  override def receive: Receive = {
-    case GetNews ⇒
-      sender() ! news
-    case "tick" ⇒
-      // Сменить новость на новую
-      news = News(isGood = Random.nextBoolean())
-  }
-}
 
 object NewsServer {
+  val newsServerServiceKey = ServiceKey("NewsServer")
 
-  case object GetNews
-
-  case class News(isGood: Boolean)
-
-}
-
-object NewsServersStarter extends App {
-  val system = ActorSystem("akka-stock-exchange-news", Configs.systemNewsServers)
-  (1 to Configs.numberOfNewsServers).map { case id ⇒
-    system.actorOf(Props[NewsServer], s"newsServer-$id")
+  def main(args: Array[String]): Unit = {
+    ActorSystem(spawnMultipleNewsServers(), Configs.actorSystemName, Configs.systemNewsServers)
   }
-  Await.result(system.whenTerminated, Duration.Inf)
+
+  private[this] def spawnMultipleNewsServers(): Behavior[NotUsed] = Behaviors.setup { ctx =>
+    for (_ <- 1 to Configs.numberOfNewsServers)
+      ctx.spawnAnonymous(init(), DispatcherSelector.fromConfig("news-server-dispatcher"))
+    Behaviors.ignore
+  }
+
+  private[this] def scheduleTick(ctx: ActorContext[NewsServerCommand]) = {
+    ctx.scheduleOnce((800 + ThreadLocalRandom.current().nextInt(400)).millis, ctx.self, Tick)
+  }
+
+  private[this] def init(): Behavior[NewsServerCommand] = Behaviors.setup { ctx =>
+    ctx.system.receptionist ! Register(newsServerServiceKey, ctx.self)
+    scheduleTick(ctx)
+    mainBehavior(News(isGood = true), System.currentTimeMillis())
+  }
+
+  private[this] def mainBehavior(currentNews: News, launchTime: Long): Behavior[NewsServerCommand] = Behaviors.receive { (ctx, message) =>
+    message match {
+      case GetNews(replyTo) =>
+        replyTo ! currentNews
+        Behaviors.same
+      case Tick =>
+        scheduleTick(ctx)
+        val modifiedNewsStatus = if ((launchTime / 10000) % 2 == 0) {
+          ThreadLocalRandom.current().nextBoolean() || ThreadLocalRandom.current().nextBoolean()
+        } else {
+          ThreadLocalRandom.current().nextBoolean() && ThreadLocalRandom.current().nextBoolean()
+        }
+        mainBehavior(News(isGood = modifiedNewsStatus), System.currentTimeMillis())
+    }
+  }
+
+  sealed trait NewsServerCommand
+
+  final case class GetNews(replyTo: ActorRef[News]) extends NewsServerCommand
+
+  final case class News(isGood: Boolean)
+
+  private[this] class NewsServerMailbox(settings: akka.actor.ActorSystem.Settings, config: Config) extends UnboundedStablePriorityMailbox(
+    PriorityGenerator {
+      case Tick => 0
+      case _ => 1
+    })
+
+  private final case object Tick extends NewsServerCommand
+
 }

@@ -1,42 +1,38 @@
 package perm.tryfuture.exchange
 
 import javafx.application.Application
-import javafx.event.EventHandler
 import javafx.scene.Scene
 import javafx.scene.chart.{LineChart, NumberAxis, XYChart}
 import javafx.scene.layout.VBox
 import javafx.scene.text.Text
-import javafx.stage.{Stage, WindowEvent}
-
-import akka.actor.{ActorSystem, Props}
+import javafx.stage.Stage
 
 object UI {
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     Application.launch(classOf[UI], args: _*)
   }
 }
 
 class UI extends Application {
-  val buysSeries = new XYChart.Series[Number, Number]
-  val sellsSeries = new XYChart.Series[Number, Number]
-  val newsSeries = new XYChart.Series[Number, Number]
+  private[this] val buysSeries = new XYChart.Series[Number, Number]
+  private[this] val sellsSeries = new XYChart.Series[Number, Number]
+  private[this] val newsSeries = new XYChart.Series[Number, Number]
 
-  def setNumberOfPositiveNews(tick: Long, newsRate: Int) = {
-    newsSeries.getData.add(new XYChart.Data(tick, newsRate))
+  def setNumberOfPositiveNews(time: Long, newsRate: Int): Boolean = {
+    newsSeries.getData.add(new XYChart.Data(time, newsRate))
   }
 
-  def setRates(tick: Long, sellRate: Int, buyRate: Int) = {
-    buysSeries.getData.add(new XYChart.Data(tick, buyRate))
-    sellsSeries.getData.add(new XYChart.Data(tick, sellRate))
-    println(buyRate + " " + sellRate)
+  def setRates(tick: Long, buyRateOpt: Option[BigDecimal], sellRateOpt: Option[BigDecimal]): Unit = {
+    buyRateOpt.map(buyRate => buysSeries.getData.add(new XYChart.Data(tick, buyRate)))
+    sellRateOpt.map(sellRate => sellsSeries.getData.add(new XYChart.Data(tick, sellRate)))
+    println(s"$tick ${buyRateOpt.getOrElse("-")} ${sellRateOpt.getOrElse("-")}")
   }
 
-  override def start(primaryStage: Stage) {
-    // Настройка интерфейса
+  override def start(primaryStage: Stage): Unit = {
     primaryStage.setTitle("Akka stock exchange demo")
     val vbox = new VBox()
-    buysSeries.setName("Buy rate")
-    sellsSeries.setName("Sells rate")
+    buysSeries.setName("Buys")
+    sellsSeries.setName("Sells")
     newsSeries.setName("News OK?")
     val xAxisPrice: NumberAxis = new NumberAxis
     val yAxisPrice: NumberAxis = new NumberAxis
@@ -51,18 +47,12 @@ class UI extends Application {
     lineChartPrice.getData.add(buysSeries)
     lineChartPrice.getData.add(sellsSeries)
     lineChartNews.getData.add(newsSeries)
-    vbox.getChildren.addAll(lineChartPrice, lineChartNews, new Text("Russia, Perm, 2015"))
+    vbox.getChildren.addAll(lineChartPrice, lineChartNews, new Text("Russia, Perm, 2018"))
     primaryStage.setScene(new Scene(vbox))
 
-    val system = ActorSystem("akka-stock-exchange-ui", Configs.systemUi)
-    system.actorOf(Props(classOf[StatisticsCollector], this))
+    val statisticsCollector = new StatisticsCollector(this)
 
-    primaryStage.setOnCloseRequest(new EventHandler[WindowEvent]() {
-      def handle(we: WindowEvent) {
-        // При закрытии формы завершить и приложение
-        system.terminate()
-      }
-    })
+    primaryStage.setOnCloseRequest(_ => statisticsCollector.actorSystem.terminate())
     primaryStage.show()
   }
 }
